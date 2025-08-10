@@ -1,0 +1,5 @@
+aiohttp==3.8.5
+python-telegram-bot==20.7
+flask==3.0.0
+requests==2.31.0
+gunicorn==21.2.0
