@@ -10,6 +10,7 @@ import tempfile
 import shutil
 from datetime import datetime, timedelta
 from threading import Thread
+import uuid
 
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -41,6 +42,10 @@ MAX_FILES_PER_PERIOD = 3
 RATE_LIMIT_HOURS = 6
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB limit
 
+# Concurrency limits
+MAX_CONCURRENT_SESSIONS = 10  # Maximum concurrent academi.cx sessions
+MAX_CONCURRENT_PER_USER = 2   # Maximum concurrent requests per user
+
 # Keep-alive Flask app
 app = Flask(__name__)
 
@@ -68,18 +73,66 @@ def run_flask():
     """Run Flask app in a separate thread"""
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
+class SessionManager:
+    """Manages session pool for concurrent users"""
+    
+    def __init__(self, max_sessions: int = MAX_CONCURRENT_SESSIONS):
+        self.max_sessions = max_sessions
+        self.active_sessions = {}
+        self.session_semaphore = asyncio.Semaphore(max_sessions)
+        self._lock = asyncio.Lock()
+    
+    async def get_session_id(self) -> str:
+        """Get a unique session ID"""
+        return str(uuid.uuid4())
+    
+    async def acquire_session(self, session_id: str) -> bool:
+        """Acquire a session slot"""
+        await self.session_semaphore.acquire()
+        async with self._lock:
+            self.active_sessions[session_id] = datetime.now()
+        return True
+    
+    async def release_session(self, session_id: str):
+        """Release a session slot"""
+        async with self._lock:
+            if session_id in self.active_sessions:
+                del self.active_sessions[session_id]
+        self.session_semaphore.release()
+    
+    async def get_active_sessions_count(self) -> int:
+        """Get count of active sessions"""
+        async with self._lock:
+            return len(self.active_sessions)
+
 class TurnitinChecker:
-    def __init__(self, username: str, password: str):
+    def __init__(self, username: str, password: str, session_id: str):
         self.username = username
         self.password = password
+        self.session_id = session_id
         self.session = None
         self.upload_endpoint = "https://academi.cx/dashboard/file_upload.php"
         
     async def login(self) -> bool:
-        """Login to academi.cx"""
-        print("🔐 Logging in...")
+        """Login to academi.cx with a fresh session"""
+        logger.info(f"🔐 Logging in... (Session: {self.session_id[:8]})")
         
-        self.session = aiohttp.ClientSession()
+        # Create a new session for each user
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=10,
+            keepalive_timeout=60,
+            enable_cleanup_closed=True
+        )
+        
+        timeout = aiohttp.ClientTimeout(total=60, connect=30)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={
+                'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 - Session-{self.session_id[:8]}'
+            }
+        )
         
         login_data = {
             'email': self.username,
@@ -88,43 +141,43 @@ class TurnitinChecker:
         }
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Referer': 'https://academi.cx/login',
             'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Session-ID': self.session_id[:8]  # Custom header for debugging
         }
         
         try:
             async with self.session.post('https://academi.cx/login/login.php', 
                                        data=login_data, headers=headers) as response:
-                print(f"Login Status: {response.status}")
+                logger.info(f"Login Status: {response.status} (Session: {self.session_id[:8]})")
                 
                 if response.status in [200, 302]:
                     response_text = await response.text()
                     if 'Dashboard' in response_text or 'dashboard' in response_text.lower():
-                        print("✅ Login successful!")
+                        logger.info(f"✅ Login successful! (Session: {self.session_id[:8]})")
                         return True
                     elif response.status == 302:
-                        print("✅ Login successful (redirected)!")
+                        logger.info(f"✅ Login successful (redirected)! (Session: {self.session_id[:8]})")
                         return True
                 
-                print("❌ Login failed")
+                logger.error(f"❌ Login failed (Session: {self.session_id[:8]})")
                 return False
                 
         except Exception as e:
-            print(f"❌ Login error: {e}")
+            logger.error(f"❌ Login error (Session: {self.session_id[:8]}): {e}")
             return False
     
     async def upload_file(self, file_path: str) -> Optional[str]:
         """Upload file and return the file ID"""
         if not os.path.exists(file_path):
-            print(f"❌ File not found: {file_path}")
+            logger.error(f"❌ File not found: {file_path} (Session: {self.session_id[:8]})")
             return None
             
-        print(f"📤 Uploading file: {os.path.basename(file_path)}")
+        logger.info(f"📤 Uploading file: {os.path.basename(file_path)} (Session: {self.session_id[:8]})")
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Referer': 'https://academi.cx/dashboard',
+            'X-Session-ID': self.session_id[:8]
         }
         
         try:
@@ -134,40 +187,40 @@ class TurnitinChecker:
                 
                 async with self.session.post(self.upload_endpoint, 
                                            data=data, headers=headers) as response:
-                    print(f"Upload Status: {response.status}")
+                    logger.info(f"Upload Status: {response.status} (Session: {self.session_id[:8]})")
                     
                     if response.status == 200:
                         try:
                             result = await response.json()
-                            print(f"✅ Upload Response: {result}")
+                            logger.info(f"✅ Upload Response: {result} (Session: {self.session_id[:8]})")
                         except:
                             response_text = await response.text()
-                            print(f"Upload Response (text): {response_text[:500]}")
+                            logger.info(f"Upload Response (text): {response_text[:200]} (Session: {self.session_id[:8]})")
                         
                         # Wait for the file to be processed and get the actual file ID
                         await asyncio.sleep(3)  # Wait for file to be processed
                         file_id = await self.get_latest_file_id()
                         if file_id:
-                            print(f"📋 Retrieved file ID: {file_id}")
+                            logger.info(f"📋 Retrieved file ID: {file_id} (Session: {self.session_id[:8]})")
                             return file_id
                         else:
-                            print("❌ Could not retrieve file ID")
+                            logger.error(f"❌ Could not retrieve file ID (Session: {self.session_id[:8]})")
                             return None
                     else:
                         response_text = await response.text()
-                        print(f"❌ Upload failed: {response.status}, {response_text[:300]}")
+                        logger.error(f"❌ Upload failed: {response.status}, {response_text[:300]} (Session: {self.session_id[:8]})")
         
         except Exception as e:
-            print(f"❌ Upload error: {e}")
+            logger.error(f"❌ Upload error (Session: {self.session_id[:8]}): {e}")
         
         return None
     
     async def get_latest_file_id(self) -> Optional[str]:
         """Get the latest file ID from dashboard"""
-        print("📋 Getting latest file ID from dashboard...")
+        logger.info(f"📋 Getting latest file ID from dashboard... (Session: {self.session_id[:8]})")
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'X-Session-ID': self.session_id[:8]
         }
         
         try:
@@ -195,34 +248,34 @@ class TurnitinChecker:
                         if fid not in unique_file_ids and len(fid) > 5:  # Filter out short IDs
                             unique_file_ids.append(fid)
                     
-                    print(f"Found file IDs: {unique_file_ids}")
+                    logger.info(f"Found file IDs: {unique_file_ids} (Session: {self.session_id[:8]})")
                     
                     # Return the first (most recent) file ID
                     if unique_file_ids:
                         latest_id = unique_file_ids[0]
-                        print(f"Using latest file ID: {latest_id}")
+                        logger.info(f"Using latest file ID: {latest_id} (Session: {self.session_id[:8]})")
                         return latest_id
                     
                     # Fallback: look for any numeric IDs that might be file IDs
                     all_numbers = re.findall(r'\b\d{10,}\b', response_text)  # Look for long numbers
                     if all_numbers:
                         fallback_id = all_numbers[0]
-                        print(f"Using fallback file ID: {fallback_id}")
+                        logger.info(f"Using fallback file ID: {fallback_id} (Session: {self.session_id[:8]})")
                         return fallback_id
         
         except Exception as e:
-            print(f"❌ Error getting file ID: {e}")
+            logger.error(f"❌ Error getting file ID (Session: {self.session_id[:8]}): {e}")
         
         return None
     
     async def trigger_report_generation(self, file_id: str) -> bool:
         """Trigger report generation by simulating the View Results button click"""
-        print(f"🔄 Triggering report generation for file ID: {file_id}")
+        logger.info(f"🔄 Triggering report generation for file ID: {file_id} (Session: {self.session_id[:8]})")
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Referer': 'https://academi.cx/dashboard',
-            'X-Requested-With': 'XMLHttpRequest'
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-Session-ID': self.session_id[:8]
         }
         
         # Try multiple endpoints that might trigger report generation
@@ -240,57 +293,56 @@ class TurnitinChecker:
                     if response.status == 200:
                         try:
                             result = await response.json()
-                            print(f"✅ Trigger response from {url}: {result}")
+                            logger.info(f"✅ Trigger response from {url}: {result} (Session: {self.session_id[:8]})")
                             return True
                         except:
                             response_text = await response.text()
                             if len(response_text) < 1000:
-                                print(f"✅ Trigger response from {url}: {response_text[:200]}")
+                                logger.info(f"✅ Trigger response from {url}: {response_text[:200]} (Session: {self.session_id[:8]})")
                             if 'success' in response_text.lower() or 'processing' in response_text.lower():
                                 return True
             except Exception as e:
-                print(f"❌ Error triggering from {url}: {e}")
+                logger.debug(f"❌ Error triggering from {url} (Session: {self.session_id[:8]}): {e}")
         
         # If no specific trigger worked, the upload itself might have triggered processing
-        print("ℹ️ No specific trigger found, reports should generate automatically after upload")
+        logger.info(f"ℹ️ No specific trigger found, reports should generate automatically after upload (Session: {self.session_id[:8]})")
         return True
     
     async def wait_for_reports(self, file_id: str, max_wait_time: int = 180) -> bool:
         """Wait for AI and similarity reports to be generated (3 minutes max)"""
-        print(f"⏳ Waiting for reports to be generated for file ID: {file_id}")
-        print("📊 Checking every 20 seconds... (minimum 2 minutes as per your note)")
+        logger.info(f"⏳ Waiting for reports to be generated for file ID: {file_id} (Session: {self.session_id[:8]})")
         
         start_time = time.time()
         check_interval = 20  # Check every 20 seconds
         min_wait_time = 120  # Wait at least 2 minutes as you mentioned
         
         # Initial wait
-        print("⏳ Initial wait of 2 minutes for report generation...")
+        logger.info(f"⏳ Initial wait of 2 minutes for report generation... (Session: {self.session_id[:8]})")
         await asyncio.sleep(min_wait_time)
         
         while time.time() - start_time < max_wait_time:
             elapsed = int(time.time() - start_time)
             minutes = elapsed // 60
             seconds = elapsed % 60
-            print(f"⏳ Checking reports... ({minutes}m {seconds}s elapsed)")
+            logger.info(f"⏳ Checking reports... ({minutes}m {seconds}s elapsed) (Session: {self.session_id[:8]})")
             
             # Check if reports are ready
             ai_ready = await self.check_report_ready(file_id, 'ai_report')
             similarity_ready = await self.check_report_ready(file_id, 'similarity_report')
             
             if ai_ready and similarity_ready:
-                print("✅ Both AI and similarity reports are ready!")
+                logger.info(f"✅ Both AI and similarity reports are ready! (Session: {self.session_id[:8]})")
                 return True
             elif ai_ready or similarity_ready:
                 ready_type = "AI" if ai_ready else "Similarity"
-                print(f"✅ {ready_type} report is ready! Other may still be processing...")
+                logger.info(f"✅ {ready_type} report is ready! Other may still be processing... (Session: {self.session_id[:8]})")
                 # Continue waiting for the other report
             else:
-                print("📊 Reports still processing...")
+                logger.info(f"📊 Reports still processing... (Session: {self.session_id[:8]})")
             
             await asyncio.sleep(check_interval)
         
-        print("⚠️ Timeout waiting for reports, attempting download anyway...")
+        logger.warning(f"⚠️ Timeout waiting for reports, attempting download anyway... (Session: {self.session_id[:8]})")
         return True  # Try download even if timeout
     
     async def check_report_ready(self, file_id: str, report_type: str) -> bool:
@@ -298,13 +350,13 @@ class TurnitinChecker:
         url = f"https://academi.cx/dashboard/download_file.php?type={report_type}&id={file_id}"
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Referer': 'https://academi.cx/dashboard',
+            'X-Session-ID': self.session_id[:8]
         }
         
         try:
             async with self.session.head(url, headers=headers, allow_redirects=True) as response:
-                print(f"📊 Checking {report_type}: Status {response.status}")
+                logger.debug(f"📊 Checking {report_type}: Status {response.status} (Session: {self.session_id[:8]})")
                 
                 if response.status == 200:
                     content_type = response.headers.get('content-type', '')
@@ -315,16 +367,16 @@ class TurnitinChecker:
                         'application' in content_type.lower() or 
                         'octet-stream' in content_type.lower() or
                         int(content_length) > 1000):  # File should be reasonably sized
-                        print(f"✅ {report_type} ready (Content: {content_type}, Size: {content_length})")
+                        logger.info(f"✅ {report_type} ready (Content: {content_type}, Size: {content_length}) (Session: {self.session_id[:8]})")
                         return True
                     else:
-                        print(f"❌ {report_type} not ready (Content: {content_type}, Size: {content_length})")
+                        logger.debug(f"❌ {report_type} not ready (Content: {content_type}, Size: {content_length}) (Session: {self.session_id[:8]})")
                         return False
                 else:
-                    print(f"❌ {report_type} not ready (Status: {response.status})")
+                    logger.debug(f"❌ {report_type} not ready (Status: {response.status}) (Session: {self.session_id[:8]})")
                     return False
         except Exception as e:
-            print(f"❌ Error checking {report_type}: {e}")
+            logger.debug(f"❌ Error checking {report_type} (Session: {self.session_id[:8]}): {e}")
             return False
     
     async def download_report(self, file_id: str, report_type: str, download_dir: str) -> Optional[str]:
@@ -332,8 +384,8 @@ class TurnitinChecker:
         url = f"https://academi.cx/dashboard/download_file.php?type={report_type}&id={file_id}"
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Referer': 'https://academi.cx/dashboard',
+            'X-Session-ID': self.session_id[:8]
         }
         
         try:
@@ -341,8 +393,8 @@ class TurnitinChecker:
                 if response.status == 200:
                     content = await response.read()
                     
-                    # Generate filename
-                    filename = f"{report_type}_{file_id}.pdf"
+                    # Generate filename with session ID to avoid conflicts
+                    filename = f"{report_type}_{file_id}_{self.session_id[:8]}.pdf"
                     filepath = os.path.join(download_dir, filename)
                     
                     # Check if content is actually a file (not an HTML error page)
@@ -350,35 +402,44 @@ class TurnitinChecker:
                         with open(filepath, 'wb') as f:
                             f.write(content)
                         
-                        print(f"✅ Downloaded {report_type}: {filepath} ({len(content)} bytes)")
+                        logger.info(f"✅ Downloaded {report_type}: {filepath} ({len(content)} bytes) (Session: {self.session_id[:8]})")
                         return filepath
                     else:
-                        print(f"❌ {report_type} download failed - received HTML instead of file")
+                        logger.error(f"❌ {report_type} download failed - received HTML instead of file (Session: {self.session_id[:8]})")
                         # Save the HTML for debugging
-                        debug_file = os.path.join(download_dir, f"debug_{report_type}_{file_id}.html")
+                        debug_file = os.path.join(download_dir, f"debug_{report_type}_{file_id}_{self.session_id[:8]}.html")
                         with open(debug_file, 'wb') as f:
                             f.write(content)
-                        print(f"🔍 Debug HTML saved to: {debug_file}")
+                        logger.info(f"🔍 Debug HTML saved to: {debug_file}")
                         return None
                 else:
-                    print(f"❌ Failed to download {report_type}: Status {response.status}")
+                    logger.error(f"❌ Failed to download {report_type}: Status {response.status} (Session: {self.session_id[:8]})")
                     return None
         
         except Exception as e:
-            print(f"❌ Error downloading {report_type}: {e}")
+            logger.error(f"❌ Error downloading {report_type} (Session: {self.session_id[:8]}): {e}")
             return None
     
     async def download_all_reports(self, file_id: str, download_dir: str) -> list:
         """Download all available reports for a file"""
-        print(f"📥 Downloading all reports for file ID: {file_id}")
+        logger.info(f"📥 Downloading all reports for file ID: {file_id} (Session: {self.session_id[:8]})")
         
         downloaded_files = []
         report_types = ['ai_report', 'similarity_report']
         
+        # Download reports concurrently
+        download_tasks = []
         for report_type in report_types:
-            filepath = await self.download_report(file_id, report_type, download_dir)
-            if filepath:
-                downloaded_files.append(filepath)
+            task = asyncio.create_task(self.download_report(file_id, report_type, download_dir))
+            download_tasks.append(task)
+        
+        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, str) and result:  # Valid file path
+                downloaded_files.append(result)
+            elif isinstance(result, Exception):
+                logger.error(f"Download task failed (Session: {self.session_id[:8]}): {result}")
         
         return downloaded_files
     
@@ -388,7 +449,7 @@ class TurnitinChecker:
         Returns:
             tuple: (success: bool, downloaded_files: list)
         """
-        print(f"🚀 Processing file: {file_path}")
+        logger.info(f"🚀 Processing file: {file_path} (Session: {self.session_id[:8]})")
         
         # Ensure download directory exists
         os.makedirs(download_dir, exist_ok=True)
@@ -398,7 +459,7 @@ class TurnitinChecker:
         if not file_id:
             return False, []
         
-        print(f"📋 File uploaded with ID: {file_id}")
+        logger.info(f"📋 File uploaded with ID: {file_id} (Session: {self.session_id[:8]})")
         
         # Trigger report generation (may not be necessary but doesn't hurt)
         await self.trigger_report_generation(file_id)
@@ -410,33 +471,118 @@ class TurnitinChecker:
         downloaded_files = await self.download_all_reports(file_id, download_dir)
         
         if downloaded_files:
-            print(f"✅ Successfully downloaded {len(downloaded_files)} report(s):")
+            logger.info(f"✅ Successfully downloaded {len(downloaded_files)} report(s) (Session: {self.session_id[:8]}):")
             for file in downloaded_files:
-                print(f"   📄 {os.path.basename(file)}")
+                logger.info(f"   📄 {os.path.basename(file)}")
             return True, downloaded_files
         else:
-            print("❌ No reports were downloaded")
+            logger.error(f"❌ No reports were downloaded (Session: {self.session_id[:8]})")
             return False, []
 
     async def close(self):
         """Close the session"""
         if self.session:
-            await self.session.close()
+            try:
+                await self.session.close()
+                logger.info(f"🔒 Session closed (Session: {self.session_id[:8]})")
+            except Exception as e:
+                logger.error(f"Error closing session (Session: {self.session_id[:8]}): {e}")
+
+class RateLimiter:
+    def __init__(self):
+        # Store user_id -> list of timestamps
+        self.user_uploads: Dict[int, List[datetime]] = {}
+        # Track active processing per user
+        self.active_processing: Dict[int, int] = {}
+        self._lock = asyncio.Lock()
+    
+    async def can_upload(self, user_id: int) -> Tuple[bool, int]:
+        """Check if user can upload. Returns (can_upload, files_used_in_period)"""
+        async with self._lock:
+            now = datetime.now()
+            cutoff_time = now - timedelta(hours=RATE_LIMIT_HOURS)
+            
+            # Get user's upload history
+            if user_id not in self.user_uploads:
+                self.user_uploads[user_id] = []
+            
+            # Remove old uploads
+            self.user_uploads[user_id] = [
+                upload_time for upload_time in self.user_uploads[user_id]
+                if upload_time > cutoff_time
+            ]
+            
+            files_used = len(self.user_uploads[user_id])
+            active_count = self.active_processing.get(user_id, 0)
+            
+            # Check both rate limits and concurrent processing limit
+            can_upload = (files_used < MAX_FILES_PER_PERIOD and 
+                         active_count < MAX_CONCURRENT_PER_USER)
+            
+            return can_upload, files_used
+    
+    async def record_upload(self, user_id: int):
+        """Record a successful upload"""
+        async with self._lock:
+            if user_id not in self.user_uploads:
+                self.user_uploads[user_id] = []
+            
+            self.user_uploads[user_id].append(datetime.now())
+    
+    async def start_processing(self, user_id: int):
+        """Record that user started processing a file"""
+        async with self._lock:
+            self.active_processing[user_id] = self.active_processing.get(user_id, 0) + 1
+    
+    async def finish_processing(self, user_id: int):
+        """Record that user finished processing a file"""
+        async with self._lock:
+            if user_id in self.active_processing:
+                self.active_processing[user_id] = max(0, self.active_processing[user_id] - 1)
+                if self.active_processing[user_id] == 0:
+                    del self.active_processing[user_id]
+    
+    async def time_until_reset(self, user_id: int) -> timedelta:
+        """Get time until user can upload again"""
+        async with self._lock:
+            if user_id not in self.user_uploads or not self.user_uploads[user_id]:
+                return timedelta(0)
+            
+            oldest_upload = min(self.user_uploads[user_id])
+            reset_time = oldest_upload + timedelta(hours=RATE_LIMIT_HOURS)
+            now = datetime.now()
+            
+            if reset_time <= now:
+                return timedelta(0)
+            
+            return reset_time - now
+
+# Global instances
+rate_limiter = RateLimiter()
+session_manager = SessionManager()
 
 # Main function to check file and return results
-async def check_file_turnitin(file_path: str, username: str, password: str) -> tuple[bool, str, list]:
+async def check_file_turnitin(file_path: str, username: str, password: str, user_id: int) -> tuple[bool, str, list]:
     """Main function to check file and return results
     
     Returns:
         tuple: (success: bool, message: str, report_files: list)
     """
-    checker = TurnitinChecker(username, password)
+    session_id = await session_manager.get_session_id()
     
     try:
+        # Acquire session slot
+        await session_manager.acquire_session(session_id)
+        logger.info(f"Session acquired: {session_id[:8]} for user {user_id}")
+        
+        checker = TurnitinChecker(username, password, session_id)
+        
         if not await checker.login():
             return False, "❌ Login failed", []
         
-        success, downloaded_files = await checker.process_file(file_path)
+        # Create user-specific download directory
+        download_dir = f"reports/user_{user_id}_{session_id[:8]}"
+        success, downloaded_files = await checker.process_file(file_path, download_dir)
         
         if success:
             return True, f"✅ File processed successfully! Downloaded {len(downloaded_files)} report(s)", downloaded_files
@@ -444,63 +590,25 @@ async def check_file_turnitin(file_path: str, username: str, password: str) -> t
             return False, "❌ Failed to process file or download reports", []
     
     except Exception as e:
+        logger.error(f"Error processing file for user {user_id} (Session: {session_id[:8]}): {e}")
         return False, f"❌ Error: {str(e)}", []
     
     finally:
-        await checker.close()
-
-class RateLimiter:
-    def __init__(self):
-        # Store user_id -> list of timestamps
-        self.user_uploads: Dict[int, List[datetime]] = {}
-    
-    def can_upload(self, user_id: int) -> Tuple[bool, int]:
-        """Check if user can upload. Returns (can_upload, files_used_in_period)"""
-        now = datetime.now()
-        cutoff_time = now - timedelta(hours=RATE_LIMIT_HOURS)
+        try:
+            if 'checker' in locals():
+                await checker.close()
+        except Exception as e:
+            logger.error(f"Error closing checker (Session: {session_id[:8]}): {e}")
         
-        # Get user's upload history
-        if user_id not in self.user_uploads:
-            self.user_uploads[user_id] = []
-        
-        # Remove old uploads
-        self.user_uploads[user_id] = [
-            upload_time for upload_time in self.user_uploads[user_id]
-            if upload_time > cutoff_time
-        ]
-        
-        files_used = len(self.user_uploads[user_id])
-        can_upload = files_used < MAX_FILES_PER_PERIOD
-        
-        return can_upload, files_used
-    
-    def record_upload(self, user_id: int):
-        """Record a successful upload"""
-        if user_id not in self.user_uploads:
-            self.user_uploads[user_id] = []
-        
-        self.user_uploads[user_id].append(datetime.now())
-    
-    def time_until_reset(self, user_id: int) -> timedelta:
-        """Get time until user can upload again"""
-        if user_id not in self.user_uploads or not self.user_uploads[user_id]:
-            return timedelta(0)
-        
-        oldest_upload = min(self.user_uploads[user_id])
-        reset_time = oldest_upload + timedelta(hours=RATE_LIMIT_HOURS)
-        now = datetime.now()
-        
-        if reset_time <= now:
-            return timedelta(0)
-        
-        return reset_time - now
-
-# Global rate limiter instance
-rate_limiter = RateLimiter()
+        # Release session slot
+        await session_manager.release_session(session_id)
+        logger.info(f"Session released: {session_id[:8]} for user {user_id}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
-    welcome_message = """
+    active_sessions = await session_manager.get_active_sessions_count()
+    
+    welcome_message = f"""
 🤖 **Welcome to PDF Plagiarism Checker Bot!**
 
 📄 **How to use:**
@@ -514,9 +622,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Detailed reports in PDF format
 
 ⏱️ **Limits:**
-• 3 files per 6 hours
-• Maximum file size: 20MB
+• {MAX_FILES_PER_PERIOD} files per {RATE_LIMIT_HOURS} hours
+• Maximum file size: {MAX_FILE_SIZE // (1024*1024)}MB
+• Max {MAX_CONCURRENT_PER_USER} files processing simultaneously per user
 • Supported format: PDF only
+
+📈 **System Status:**
+• Active processing sessions: {active_sessions}/{MAX_CONCURRENT_SESSIONS}
 
 Just send me a PDF file to get started! 🚀
 """
@@ -525,7 +637,7 @@ Just send me a PDF file to get started! 🚀
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command"""
-    help_text = """
+    help_text = f"""
 🔧 **Commands:**
 /start - Start the bot
 /help - Show this help message
@@ -538,13 +650,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚠️ **Important Notes:**
 • Only PDF files are supported
-• Maximum file size: 20MB
+• Maximum file size: {MAX_FILE_SIZE // (1024*1024)}MB
 • Processing takes 2-3 minutes
-• You can check 3 files every 6 hours
+• You can check {MAX_FILES_PER_PERIOD} files every {RATE_LIMIT_HOURS} hours
+• Maximum {MAX_CONCURRENT_PER_USER} files processing at once
 
 🆘 **Having issues?** Make sure your file is:
 • In PDF format
-• Under 20MB in size
+• Under {MAX_FILE_SIZE // (1024*1024)}MB in size
 • Not password protected
 """
     
@@ -553,32 +666,52 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /status command"""
     user_id = update.effective_user.id
-    can_upload, files_used = rate_limiter.can_upload(user_id)
+    can_upload, files_used = await rate_limiter.can_upload(user_id)
+    active_sessions = await session_manager.get_active_sessions_count()
     
     if can_upload:
         remaining = MAX_FILES_PER_PERIOD - files_used
+        active_processing = rate_limiter.active_processing.get(user_id, 0)
+        
         status_text = f"""
 📊 **Your Status:**
 
 ✅ You can upload files!
 📈 Files used in last {RATE_LIMIT_HOURS} hours: {files_used}/{MAX_FILES_PER_PERIOD}
 🔄 Remaining uploads: {remaining}
+⚡ Currently processing: {active_processing}/{MAX_CONCURRENT_PER_USER}
+
+📈 **System Status:**
+🖥️ Active sessions: {active_sessions}/{MAX_CONCURRENT_SESSIONS}
 
 Send me a PDF file to analyze! 📄
 """
     else:
-        time_until_reset = rate_limiter.time_until_reset(user_id)
+        time_until_reset = await rate_limiter.time_until_reset(user_id)
         hours = int(time_until_reset.total_seconds() // 3600)
         minutes = int((time_until_reset.total_seconds() % 3600) // 60)
+        active_processing = rate_limiter.active_processing.get(user_id, 0)
+        
+        # Determine why user can't upload
+        if files_used >= MAX_FILES_PER_PERIOD:
+            reason = f"❌ Upload limit reached ({files_used}/{MAX_FILES_PER_PERIOD})"
+        elif active_processing >= MAX_CONCURRENT_PER_USER:
+            reason = f"⏳ Too many files processing ({active_processing}/{MAX_CONCURRENT_PER_USER})"
+        else:
+            reason = "❌ Upload not available"
         
         status_text = f"""
 📊 **Your Status:**
 
-❌ Upload limit reached
+{reason}
 📈 Files used: {files_used}/{MAX_FILES_PER_PERIOD}
+⚡ Currently processing: {active_processing}/{MAX_CONCURRENT_PER_USER}
 ⏰ Reset in: {hours}h {minutes}m
 
-You can upload more files after the reset time.
+📈 **System Status:**
+🖥️ Active sessions: {active_sessions}/{MAX_CONCURRENT_SESSIONS}
+
+You can upload more files after the reset time or when current processing completes.
 """
     
     await update.message.reply_text(status_text, parse_mode='Markdown')
@@ -611,28 +744,56 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Check rate limiting
-    can_upload, files_used = rate_limiter.can_upload(user_id)
+    # Check rate limiting and concurrency
+    can_upload, files_used = await rate_limiter.can_upload(user_id)
     if not can_upload:
-        time_until_reset = rate_limiter.time_until_reset(user_id)
-        hours = int(time_until_reset.total_seconds() // 3600)
-        minutes = int((time_until_reset.total_seconds() % 3600) // 60)
+        active_processing = rate_limiter.active_processing.get(user_id, 0)
         
+        if active_processing >= MAX_CONCURRENT_PER_USER:
+            await update.message.reply_text(
+                f"⏳ **Too many files processing!**\n\n"
+                f"You have {active_processing} files currently being processed.\n"
+                f"Please wait for them to complete before uploading more.\n\n"
+                f"Maximum concurrent uploads: {MAX_CONCURRENT_PER_USER}",
+                parse_mode='Markdown'
+            )
+            return
+        else:
+            time_until_reset = await rate_limiter.time_until_reset(user_id)
+            hours = int(time_until_reset.total_seconds() // 3600)
+            minutes = int((time_until_reset.total_seconds() % 3600) // 60)
+            
+            await update.message.reply_text(
+                f"⏱️ **Upload limit reached!**\n\n"
+                f"You've used all {MAX_FILES_PER_PERIOD} uploads for this {RATE_LIMIT_HOURS}-hour period.\n"
+                f"⏰ Next upload available in: {hours}h {minutes}m\n\n"
+                f"Use /status to check your current limits.",
+                parse_mode='Markdown'
+            )
+            return
+    
+    # Check system capacity
+    active_sessions = await session_manager.get_active_sessions_count()
+    if active_sessions >= MAX_CONCURRENT_SESSIONS:
         await update.message.reply_text(
-            f"⏱️ **Upload limit reached!**\n\n"
-            f"You've used all {MAX_FILES_PER_PERIOD} uploads for this {RATE_LIMIT_HOURS}-hour period.\n"
-            f"⏰ Next upload available in: {hours}h {minutes}m\n\n"
-            f"Use /status to check your current limits.",
+            f"🔄 **System busy!**\n\n"
+            f"All {MAX_CONCURRENT_SESSIONS} processing slots are currently in use.\n"
+            f"Please try again in a few minutes.\n\n"
+            f"Use /status to check system availability.",
             parse_mode='Markdown'
         )
         return
+    
+    # Start processing counter
+    await rate_limiter.start_processing(user_id)
     
     # Send initial processing message
     processing_message = await update.message.reply_text(
         f"📄 **Processing your PDF...**\n\n"
         f"📁 File: `{document.file_name}`\n"
         f"📊 Size: {document.file_size / 1024:.1f} KB\n"
-        f"🔄 Status: Downloading...\n\n"
+        f"🔄 Status: Downloading...\n"
+        f"⚡ Queue position: Processing now\n\n"
         f"⏱️ This will take 2-3 minutes. Please wait...",
         parse_mode='Markdown'
     )
@@ -643,7 +804,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_dir = None
     try:
         # Create temporary directory for this processing
-        temp_dir = tempfile.mkdtemp()
+        temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_")
         
         # Download the file
         file = await document.get_file()
@@ -655,7 +816,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📄 **Processing your PDF...**\n\n"
             f"📁 File: `{document.file_name}`\n"
             f"📊 Size: {document.file_size / 1024:.1f} KB\n"
-            f"🔄 Status: Analyzing content...\n\n"
+            f"🔄 Status: Analyzing content...\n"
+            f"🔗 Session acquired, processing...\n\n"
             f"⏱️ This will take 2-3 minutes. Please wait...",
             parse_mode='Markdown'
         )
@@ -664,12 +826,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Process the file with your academia.cx checker
         success, message, report_files = await check_file_turnitin(
-            file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD
+            file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, user_id
         )
         
         if success and report_files:
             # Record successful upload for rate limiting
-            rate_limiter.record_upload(user_id)
+            await rate_limiter.record_upload(user_id)
             
             # Update status to sending reports
             await processing_message.edit_text(
@@ -695,7 +857,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_document(
                             chat_id=update.effective_chat.id,
                             document=f,
-                            filename=f"{report_type}_{document.file_name}",
+                            filename=f"{report_type.replace('🤖', 'AI').replace('📊', 'Similarity')}_{document.file_name}",
                             caption=f"{report_type}\n📁 Original file: `{document.file_name}`",
                             parse_mode='Markdown'
                         )
@@ -707,7 +869,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"❌ Error sending {report_type}")
             
             # Send completion message
-            remaining_uploads = MAX_FILES_PER_PERIOD - (files_used + 1)
+            can_upload_again, files_used_now = await rate_limiter.can_upload(user_id)
+            remaining_uploads = MAX_FILES_PER_PERIOD - files_used_now
             completion_text = f"""
 🎉 **Analysis Complete!**
 
@@ -715,7 +878,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📊 Reports sent: {len(report_files)}
 
 📈 **Usage Status:**
-• Files used today: {files_used + 1}/{MAX_FILES_PER_PERIOD}
+• Files used in {RATE_LIMIT_HOURS}h: {files_used_now}/{MAX_FILES_PER_PERIOD}
 • Remaining uploads: {remaining_uploads}
 
 Thank you for using our service! 🚀
@@ -752,6 +915,9 @@ Thank you for using our service! 🚀
             )
     
     finally:
+        # Always finish processing counter
+        await rate_limiter.finish_processing(user_id)
+        
         # Cleanup temporary files
         if temp_dir and os.path.exists(temp_dir):
             try:
@@ -770,7 +936,7 @@ async def handle_non_document(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def main():
     """Start the bot"""
-    print("🤖 Starting Telegram Bot...")
+    print("🤖 Starting Multi-User Concurrent Telegram Bot...")
     
     # Start Flask app in a separate thread
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -796,36 +962,45 @@ def main():
     # Handle non-document messages
     application.add_handler(MessageHandler(~filters.Document.ALL, handle_non_document))
     
-    print("✅ Bot started successfully!")
+    print(f"✅ Bot started successfully with concurrent processing!")
+    print(f"📊 Max concurrent sessions: {MAX_CONCURRENT_SESSIONS}")
+    print(f"👥 Max concurrent per user: {MAX_CONCURRENT_PER_USER}")
     print("🔍 Waiting for users to send PDF files...")
     
     # Start polling
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # Quick test function for standalone testing
-async def quick_test(file_path: str) -> tuple[bool, list]:
+async def quick_test(file_path: str, user_id: int = 12345) -> tuple[bool, list]:
     """Quick test function that returns success status and downloaded files"""
-    success, message, files = await check_file_turnitin(file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD)
+    success, message, files = await check_file_turnitin(file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, user_id)
     print(message)
     return success, files
 
 # Test the enhanced functionality (for development only)
 async def test_checker():
     """Test function for development - remove in production"""
-    print("🚀 Testing Turnitin Checker")
+    print("🚀 Testing Multi-User Turnitin Checker")
     print("=" * 50)
     
     test_file = "test.pdf"  # Replace with your test file
     
     if os.path.exists(test_file):
-        success, downloaded_files = await quick_test(test_file)
+        # Test with multiple concurrent users
+        tasks = []
+        for user_id in range(1, 4):  # Test with 3 users
+            task = quick_test(test_file, user_id)
+            tasks.append(task)
         
-        if success:
-            print(f"\n🎉 SUCCESS! Downloaded files:")
-            for file in downloaded_files:
-                print(f"   📄 {file}")
-        else:
-            print(f"\n❌ Test failed")
+        print("Testing concurrent processing...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, result in enumerate(results, 1):
+            if isinstance(result, tuple):
+                success, files = result
+                print(f"User {i}: {'SUCCESS' if success else 'FAILED'}, Files: {len(files)}")
+            else:
+                print(f"User {i}: ERROR - {result}")
     else:
         print(f"⚠️ Test file not found: {test_file}")
         print("Please create a test PDF file to test the functionality")
