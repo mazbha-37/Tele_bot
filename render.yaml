@@ -1,9 +1,9 @@
 services:
-  - type: web
-    name: telegram-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+  - type: worker
+    name: tele-bot-worker
+    env: docker
+    plan: free
+    autoDeploy: true
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -12,6 +12,4 @@ services:
       - key: ACADEMI_PASSWORD
         sync: false
       - key: RENDER_URL
-        sync: false
-      - key: PORT
-        value: 10000
+        value: ""   # leave empty for polling
