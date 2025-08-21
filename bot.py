@@ -659,7 +659,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Max {MAX_CONCURRENT_PER_USER} files processing simultaneously per user
 • Supported format: PDF only
 
-⭐ **Premium:** `/premium OpenCvA1@slr` → 15 files / 6h
+⭐ **Premium:** `/premium ######` → 15 files / 6h
 
 📈 **System Status:**
 • Active sessions: {active_sessions}/{MAX_CONCURRENT_SESSIONS}
