@@ -9,18 +9,19 @@ import re
 import tempfile
 import shutil
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Thread, Timer
 import uuid
 from dataclasses import dataclass
+import random
+import unicodedata
+from urllib.parse import quote as url_quote
 
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ChatAction
 
 # Keep-alive server (Render Web Service needs to bind to $PORT even if we're polling)
 from flask import Flask
 import requests
-from threading import Timer
 
 # -------------------------------------------------------------------
 # Logging
@@ -107,6 +108,26 @@ def run_flask():
     app.run(host='0.0.0.0', port=PORT, debug=False)
 
 # -------------------------------------------------------------------
+# Helpers used by the checker
+# -------------------------------------------------------------------
+def _filename_variants(marker: str) -> List[str]:
+    """Generate variants of the marker as it might appear in HTML."""
+    variants = set()
+    variants.add(marker)
+    variants.add(url_quote(marker))
+    # fold to ascii
+    ascii_fold = unicodedata.normalize('NFKD', marker).encode('ascii', 'ignore').decode('ascii')
+    variants.add(ascii_fold)
+    # underscore / dash alternatives
+    u = re.sub(r'[^A-Za-z0-9.\-_]+', '_', ascii_fold)
+    d = re.sub(r'[^A-Za-z0-9.\-_]+', '-', ascii_fold)
+    variants.add(u); variants.add(d)
+    # possible truncation
+    if len(u) > 60: variants.add(u[:60])
+    if len(d) > 60: variants.add(d[:60])
+    return [v for v in variants if v]
+
+# -------------------------------------------------------------------
 # Processing structures
 # -------------------------------------------------------------------
 @dataclass
@@ -133,7 +154,7 @@ class ConcurrentProcessingManager:
         self._lock = asyncio.Lock()
         self.workers_started = False
 
-    async def start_workers(self, num_workers: int = 5):
+    async def start_workers(self, num_workers: int = 8):
         if self.workers_started:
             return
         logger.info(f"Starting {num_workers} processing workers...")
@@ -160,10 +181,10 @@ class ConcurrentProcessingManager:
                 if job.job_id in self.active_jobs:
                     del self.active_jobs[job.job_id]
                 if job.user_id in self.user_active_jobs:
-                    if job.job_id in self.user_active_jobs[user_id]:
-                        self.user_active_jobs[user_id].remove(job.job_id)
-                    if not self.user_active_jobs[user_id]:
-                        del self.user_active_jobs[user_id]
+                    if job.job_id in self.user_active_jobs[job.user_id]:
+                        self.user_active_jobs[job.user_id].remove(job.job_id)
+                    if not self.user_active_jobs[job.user_id]:
+                        del self.user_active_jobs[job.user_id]
             return False
 
     async def _worker(self, worker_name: str):
@@ -337,13 +358,13 @@ class SessionManager:
             return len(self.active_sessions)
 
 # -------------------------------------------------------------------
-# Academi / Turnitin-like checker (with filename-based deconfliction)
+# Academi checker using get_file_status.php (strict, no cross-mixing)
 # -------------------------------------------------------------------
 class TurnitinChecker:
     """
-    Uploads with a per-job UNIQUE filename and retrieves the matching file_id
-    by searching the dashboard HTML *near that exact filename*. We NEVER fall
-    back to "first id on page" anymore to avoid cross-user mixups.
+    Uploads with a safe ASCII marker filename and retrieves the matching file_id
+    by polling /dashboard/get_file_status.php and extracting the id that appears
+    in download links near that marker. Never falls back to an unrelated ID.
     """
     def __init__(self, username: str, password: str, session_id: str):
         self.username = username
@@ -351,7 +372,7 @@ class TurnitinChecker:
         self.session_id = session_id
         self.session: Optional[aiohttp.ClientSession] = None
         self.upload_endpoint = "https://academi.cx/dashboard/file_upload.php"
-        self.last_uploaded_name: Optional[str] = None  # unique filename we send
+        self.marker_filename: Optional[str] = None
 
     async def login(self) -> bool:
         logger.info(f"🔐 Logging in... (Session: {self.session_id[:8]})")
@@ -359,17 +380,20 @@ class TurnitinChecker:
             limit=20, limit_per_host=10, keepalive_timeout=60,
             enable_cleanup_closed=True, use_dns_cache=True, ttl_dns_cache=300
         )
-        timeout = aiohttp.ClientTimeout(total=90, connect=30)
+        timeout = aiohttp.ClientTimeout(total=120, connect=30)
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers={'User-Agent': f'Mozilla/5.0 Session-{self.session_id[:8]}'}
+            headers={
+                # mimic a common mobile UA (matches what your browser showed)
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36'
+            }
         )
-        login_data = {'email': self.username, 'password': self.password, 'rememberme': 'on'}
+        data = {'email': self.username, 'password': self.password, 'rememberme': 'on'}
         headers = {'Referer': 'https://academi.cx/login', 'Content-Type': 'application/x-www-form-urlencoded'}
         try:
-            async with self.session.post('https://academi.cx/login/login.php',
-                                         data=login_data, headers=headers) as resp:
+            async with self.session.post('https://academi.cx/login/login.php', data=data, headers=headers) as resp:
                 txt = await resp.text()
                 if resp.status in [200, 302] and ('dashboard' in txt.lower() or resp.status == 302):
                     logger.info(f"✅ Login successful (Session: {self.session_id[:8]})")
@@ -378,23 +402,27 @@ class TurnitinChecker:
             logger.error(f"❌ Login error: {e}")
         return False
 
+    def _build_safe_marker_name(self) -> str:
+        ts = int(time.time())
+        rnd = random.randint(1000, 9999)
+        # strictly ASCII/dash; stable across sanitizers
+        return f"bot-{self.session_id[:8]}-{ts}-{rnd}.pdf"
+
     async def upload_file(self, file_path: str) -> Optional[str]:
-        """Upload with a UNIQUE filename; then wait until that exact filename appears and extract its id."""
+        """Upload with a SAFE marker filename; then wait until that marker appears in get_file_status and extract id."""
         if not os.path.exists(file_path):
             logger.error(f"❌ File not found: {file_path}")
             return None
 
-        # Unique, collision-proof name per job
-        base = os.path.basename(file_path)
-        unique_name = f"{self.session_id[:8]}__{int(time.time())}__{base}"
-        self.last_uploaded_name = unique_name
-        logger.info(f"📤 Uploading as: {unique_name} (Session: {self.session_id[:8]})")
+        self.marker_filename = self._build_safe_marker_name()
+        logger.info(f"📤 Uploading as: {self.marker_filename} (Session: {self.session_id[:8]})")
 
         headers = {'Referer': 'https://academi.cx/dashboard'}
         try:
             with open(file_path, 'rb') as f:
                 form = aiohttp.FormData()
-                form.add_field('file', f, filename=unique_name)
+                # important: set filename to the safe marker
+                form.add_field('file', f, filename=self.marker_filename)
                 async with self.session.post(self.upload_endpoint, data=form, headers=headers) as resp:
                     logger.info(f"Upload Status: {resp.status} (Session: {self.session_id[:8]})")
                     if resp.status != 200:
@@ -403,59 +431,69 @@ class TurnitinChecker:
             logger.error(f"❌ Upload error: {e}")
             return None
 
-        # After uploading, poll dashboard until *that exact filename* is visible and get its ID.
-        file_id = await self._wait_for_exact_filename_and_get_id(unique_name, max_wait=120, interval=5)
-        if not file_id:
-            logger.error("❌ Could not find matching file ID for uploaded filename (strict mode).")
-        else:
-            logger.info(f"📋 Matched file ID {file_id} for {unique_name}")
-        return file_id
+        return await self._find_id_via_status(self.marker_filename, max_wait=240, interval=6)
 
-    async def _wait_for_exact_filename_and_get_id(self, filename: str, max_wait: int = 120, interval: int = 5) -> Optional[str]:
-        """Poll the dashboard for up to max_wait seconds until the exact filename is present, then extract its id."""
-        start = time.time()
-        while time.time() - start < max_wait:
-            fid = await self._get_file_id_by_exact_filename(filename)
-            if fid:
-                return fid
-            await asyncio.sleep(interval)
+    async def _get_status_html(self) -> Optional[str]:
+        """Fetch /dashboard/get_file_status.php with retries/backoff."""
+        url = 'https://academi.cx/dashboard/get_file_status.php'
+        attempt, max_attempts = 0, 7
+        delay = 0.6
+        last_err = None
+        while attempt < max_attempts:
+            try:
+                async with self.session.get(url, headers={'Referer': 'https://academi.cx/dashboard/'}) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    last_err = RuntimeError(f"HTTP {resp.status}")
+            except Exception as e:
+                last_err = e
+            await asyncio.sleep(delay * (2 ** attempt) + random.random() * 0.25)
+            attempt += 1
+        logger.error(f"⚠️ Status fetch failed: {last_err}")
         return None
 
-    async def _get_file_id_by_exact_filename(self, filename: str) -> Optional[str]:
-        """Fetch dashboard HTML and extract the id near the exact filename occurrence. No global fallbacks."""
-        try:
-            async with self.session.get('https://academi.cx/dashboard') as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text()
+    async def _find_id_via_status(self, marker_name: str, *, max_wait: int, interval: int) -> Optional[str]:
+        """Poll get_file_status until the marker (or its variants) appears, then extract id from nearby download links."""
+        variants = _filename_variants(marker_name)
+        start = time.time()
+        while time.time() - start < max_wait:
+            html = await self._get_status_html()
+            if not html:
+                await asyncio.sleep(interval)
+                continue
 
-                # Ensure we only proceed when the exact filename is present
-                idx = html.find(filename)
-                if idx == -1:
-                    return None
+            # find the first variant that appears
+            chosen_idx = -1
+            for var in variants:
+                idx = html.find(var)
+                if idx != -1:
+                    chosen_idx = idx
+                    break
 
-                # Look around the filename for structured id hints
-                window = 4000
-                snippet = html[max(0, idx - window): idx + window]
+            if chosen_idx != -1:
+                # Search only around the found marker
+                window = 5000
+                snippet = html[max(0, chosen_idx - window): chosen_idx + window]
 
-                # Most specific first
-                m1 = re.search(r"openModal\(['\"][^'\"]*['\"],\s*['\"](\d+)['\"]\)", snippet)
-                if m1:
-                    return m1.group(1)
+                # extract id from the nearby download links
+                # e.g. download_file.php?type=ai_report&id=17557969812226
+                m = re.search(r"download_file\.php\?type=(?:ai_report|similarity_report)&id=(\d+)", snippet)
+                if m:
+                    file_id = m.group(1)
+                    logger.info(f"📋 Matched file id {file_id} near marker '{marker_name}'")
+                    return file_id
 
-                m2 = re.search(r"data-file-id=['\"](\d+)['\"]", snippet)
+                # also try generic id=... if download links are constructed elsewhere
+                m2 = re.search(r"[?&]id=(\d{6,})", snippet)
                 if m2:
-                    return m2.group(1)
+                    file_id = m2.group(1)
+                    logger.info(f"📋 Matched file id {file_id} (generic) near marker '{marker_name}'")
+                    return file_id
 
-                # Last-ditch: any “id=123456” very close to the filename
-                m3 = re.search(r"[?&]id=(\d{6,})", snippet)
-                if m3:
-                    return m3.group(1)
+            await asyncio.sleep(interval)
 
-                return None
-        except Exception as e:
-            logger.error(f"❌ Error parsing dashboard for {filename}: {e}")
-            return None
+        logger.error("❌ Could not find matching file ID for uploaded marker (strict status mode).")
+        return None
 
     async def trigger_report_generation(self, file_id: str) -> bool:
         logger.info(f"🔄 Triggering report generation for {file_id}")
@@ -474,7 +512,7 @@ class TurnitinChecker:
                 pass
         return True
 
-    async def wait_for_reports(self, file_id: str, max_wait_time: int = 180) -> bool:
+    async def wait_for_reports(self, file_id: str, max_wait_time: int = 240) -> bool:
         logger.info(f"⏳ Waiting for reports for {file_id}")
         start = time.time()
         check_interval = 20
@@ -507,7 +545,6 @@ class TurnitinChecker:
             async with self.session.get(url) as resp:
                 if resp.status == 200:
                     content = await resp.read()
-                    # name includes session to avoid any overwrites
                     filename = f"{report_type}_{file_id}_{self.session_id[:8]}.pdf"
                     path = os.path.join(download_dir, filename)
                     if len(content) > 1000 and not content.startswith(b'<!DOCTYPE'):
@@ -530,7 +567,6 @@ class TurnitinChecker:
     async def process_file(self, file_path: str, download_dir: str = "reports") -> tuple[bool, list]:
         file_id = await self.upload_file(file_path)
         if not file_id:
-            # STRICT: do not proceed if we failed to match our filename to an id
             return False, []
         await self.trigger_report_generation(file_id)
         await self.wait_for_reports(file_id)
@@ -543,7 +579,6 @@ class TurnitinChecker:
                 await self.session.close()
             except Exception as e:
                 logger.error(f"Error closing session: {e}")
-
 
 # -------------------------------------------------------------------
 # Rate Limiter (dynamic per-user limits)
@@ -923,7 +958,6 @@ def main():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "test":
-        # Optional: you can keep your test harness if you want
         pass
     else:
         main()
