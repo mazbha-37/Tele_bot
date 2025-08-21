@@ -340,6 +340,11 @@ class SessionManager:
 # Academi / Turnitin-like checker (with filename-based deconfliction)
 # -------------------------------------------------------------------
 class TurnitinChecker:
+    """
+    Uploads with a per-job UNIQUE filename and retrieves the matching file_id
+    by searching the dashboard HTML *near that exact filename*. We NEVER fall
+    back to "first id on page" anymore to avoid cross-user mixups.
+    """
     def __init__(self, username: str, password: str, session_id: str):
         self.username = username
         self.password = password
@@ -358,9 +363,7 @@ class TurnitinChecker:
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers={
-                'User-Agent': f'Mozilla/5.0 Session-{self.session_id[:8]}'
-            }
+            headers={'User-Agent': f'Mozilla/5.0 Session-{self.session_id[:8]}'}
         )
         login_data = {'email': self.username, 'password': self.password, 'rememberme': 'on'}
         headers = {'Referer': 'https://academi.cx/login', 'Content-Type': 'application/x-www-form-urlencoded'}
@@ -376,83 +379,83 @@ class TurnitinChecker:
         return False
 
     async def upload_file(self, file_path: str) -> Optional[str]:
-        """Upload with a UNIQUE filename so we can later find the correct file ID."""
+        """Upload with a UNIQUE filename; then wait until that exact filename appears and extract its id."""
         if not os.path.exists(file_path):
             logger.error(f"❌ File not found: {file_path}")
             return None
 
-        unique_name = f"{self.session_id[:8]}__{os.path.basename(file_path)}"
+        # Unique, collision-proof name per job
+        base = os.path.basename(file_path)
+        unique_name = f"{self.session_id[:8]}__{int(time.time())}__{base}"
         self.last_uploaded_name = unique_name
         logger.info(f"📤 Uploading as: {unique_name} (Session: {self.session_id[:8]})")
 
         headers = {'Referer': 'https://academi.cx/dashboard'}
         try:
             with open(file_path, 'rb') as f:
-                data = aiohttp.FormData()
-                data.add_field('file', f, filename=unique_name)
-                async with self.session.post(self.upload_endpoint, data=data, headers=headers) as response:
-                    logger.info(f"Upload Status: {response.status} (Session: {self.session_id[:8]})")
-                    if response.status == 200:
-                        await asyncio.sleep(3)
-                        # find the file ID that matches our unique filename
-                        file_id = await self.get_latest_file_id(expected_filename=unique_name)
-                        if file_id:
-                            logger.info(f"📋 Matched file ID {file_id} for {unique_name}")
-                            return file_id
-                        logger.error("❌ Could not match uploaded file ID")
+                form = aiohttp.FormData()
+                form.add_field('file', f, filename=unique_name)
+                async with self.session.post(self.upload_endpoint, data=form, headers=headers) as resp:
+                    logger.info(f"Upload Status: {resp.status} (Session: {self.session_id[:8]})")
+                    if resp.status != 200:
+                        return None
         except Exception as e:
             logger.error(f"❌ Upload error: {e}")
-        return None
-
-    async def _extract_nearby_id(self, html: str, filename: str) -> Optional[str]:
-        """Find the openModal()/data-file-id nearest to the filename occurrence."""
-        idx = html.find(filename)
-        if idx == -1:
             return None
-        window = 2000  # look around the filename
-        start = max(0, idx - window)
-        end = min(len(html), idx + window)
 
-        snippet = html[start:end]
+        # After uploading, poll dashboard until *that exact filename* is visible and get its ID.
+        file_id = await self._wait_for_exact_filename_and_get_id(unique_name, max_wait=120, interval=5)
+        if not file_id:
+            logger.error("❌ Could not find matching file ID for uploaded filename (strict mode).")
+        else:
+            logger.info(f"📋 Matched file ID {file_id} for {unique_name}")
+        return file_id
 
-        # Try common patterns inside that neighborhood
-        m = re.search(r"openModal\(['\"][^'\"]*['\"],\s*['\"](\d+)['\"]\)", snippet)
-        if m:
-            return m.group(1)
-        m2 = re.search(r"data-file-id=['\"](\d+)['\"]", snippet)
-        if m2:
-            return m2.group(1)
-        # fallback: any longish number nearby
-        m3 = re.search(r"\b(\d{6,})\b", snippet)
-        if m3:
-            return m3.group(1)
+    async def _wait_for_exact_filename_and_get_id(self, filename: str, max_wait: int = 120, interval: int = 5) -> Optional[str]:
+        """Poll the dashboard for up to max_wait seconds until the exact filename is present, then extract its id."""
+        start = time.time()
+        while time.time() - start < max_wait:
+            fid = await self._get_file_id_by_exact_filename(filename)
+            if fid:
+                return fid
+            await asyncio.sleep(interval)
         return None
 
-    async def get_latest_file_id(self, expected_filename: Optional[str] = None) -> Optional[str]:
-        logger.info(f"📋 Getting file ID (expecting {expected_filename}) (Session: {self.session_id[:8]})")
+    async def _get_file_id_by_exact_filename(self, filename: str) -> Optional[str]:
+        """Fetch dashboard HTML and extract the id near the exact filename occurrence. No global fallbacks."""
         try:
-            async with self.session.get('https://academi.cx/dashboard') as response:
-                if response.status == 200:
-                    html = await response.text()
+            async with self.session.get('https://academi.cx/dashboard') as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
 
-                    # If we know the unique filename, try to get the ID closest to it
-                    if expected_filename:
-                        fid = await self._extract_nearby_id(html, expected_filename)
-                        if fid:
-                            return fid
+                # Ensure we only proceed when the exact filename is present
+                idx = html.find(filename)
+                if idx == -1:
+                    return None
 
-                    # Generic fallback (old behavior)
-                    patterns = [
-                        r"openModal\(['\"][^'\"]*['\"],\s*['\"](\d+)['\"]",
-                        r"data-file-id=['\"](\d+)['\"]",
-                    ]
-                    for pat in patterns:
-                        matches = re.findall(pat, html)
-                        if matches:
-                            return matches[0]
+                # Look around the filename for structured id hints
+                window = 4000
+                snippet = html[max(0, idx - window): idx + window]
+
+                # Most specific first
+                m1 = re.search(r"openModal\(['\"][^'\"]*['\"],\s*['\"](\d+)['\"]\)", snippet)
+                if m1:
+                    return m1.group(1)
+
+                m2 = re.search(r"data-file-id=['\"](\d+)['\"]", snippet)
+                if m2:
+                    return m2.group(1)
+
+                # Last-ditch: any “id=123456” very close to the filename
+                m3 = re.search(r"[?&]id=(\d{6,})", snippet)
+                if m3:
+                    return m3.group(1)
+
+                return None
         except Exception as e:
-            logger.error(f"❌ Error getting file ID: {e}")
-        return None
+            logger.error(f"❌ Error parsing dashboard for {filename}: {e}")
+            return None
 
     async def trigger_report_generation(self, file_id: str) -> bool:
         logger.info(f"🔄 Triggering report generation for {file_id}")
@@ -491,8 +494,8 @@ class TurnitinChecker:
             async with self.session.head(url, allow_redirects=True) as resp:
                 if resp.status == 200:
                     ct = resp.headers.get('content-type', '')
-                    cl = resp.headers.get('content-length', '0')
-                    if ('pdf' in ct.lower() or 'application' in ct.lower() or int(cl or 0) > 1000):
+                    cl = int(resp.headers.get('content-length', '0') or 0)
+                    if ('pdf' in ct.lower() or 'application' in ct.lower() or cl > 1000):
                         return True
         except Exception:
             pass
@@ -504,6 +507,7 @@ class TurnitinChecker:
             async with self.session.get(url) as resp:
                 if resp.status == 200:
                     content = await resp.read()
+                    # name includes session to avoid any overwrites
                     filename = f"{report_type}_{file_id}_{self.session_id[:8]}.pdf"
                     path = os.path.join(download_dir, filename)
                     if len(content) > 1000 and not content.startswith(b'<!DOCTYPE'):
@@ -516,16 +520,17 @@ class TurnitinChecker:
 
     async def download_all_reports(self, file_id: str, download_dir: str) -> list:
         os.makedirs(download_dir, exist_ok=True)
-        tasks = [
+        results = await asyncio.gather(
             self.download_report(file_id, 'ai_report', download_dir),
-            self.download_report(file_id, 'similarity_report', download_dir)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            self.download_report(file_id, 'similarity_report', download_dir),
+            return_exceptions=True
+        )
         return [r for r in results if isinstance(r, str) and r]
 
     async def process_file(self, file_path: str, download_dir: str = "reports") -> tuple[bool, list]:
         file_id = await self.upload_file(file_path)
         if not file_id:
+            # STRICT: do not proceed if we failed to match our filename to an id
             return False, []
         await self.trigger_report_generation(file_id)
         await self.wait_for_reports(file_id)
@@ -538,6 +543,7 @@ class TurnitinChecker:
                 await self.session.close()
             except Exception as e:
                 logger.error(f"Error closing session: {e}")
+
 
 # -------------------------------------------------------------------
 # Rate Limiter (dynamic per-user limits)
