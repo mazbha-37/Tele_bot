@@ -1,15 +1,15 @@
 services:
-  - type: worker
-    name: tele-bot-worker
+  - type: web
+    name: telegram-bot
     env: docker
     plan: free
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
-        sync: false
+        value: "7504576229:AAHFIJSD_ZLQv95XVgSBe-SOOoO5JkacsOE"
       - key: ACADEMI_USERNAME
-        sync: false
+        value: "your-username"
       - key: ACADEMI_PASSWORD
-        sync: false
+        value: "your-password"
       - key: RENDER_URL
-        value: ""   # leave empty for polling
+        value: "https://telegram-bot.onrender.com"
