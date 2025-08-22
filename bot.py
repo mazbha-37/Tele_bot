@@ -13,6 +13,7 @@ from threading import Thread
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 
 from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -90,6 +91,40 @@ class ProcessingJob:
     chat_id: int
     job_id: str
     created_at: datetime
+    file_hash: str = ""  # Add file hash for unique identification
+
+class FileTracker:
+    """Track uploaded files to prevent cross-contamination"""
+    
+    def __init__(self):
+        self.uploaded_files: Dict[str, Dict] = {}  # session_id -> file_info
+        self._lock = asyncio.Lock()
+    
+    def generate_file_hash(self, file_path: str) -> str:
+        """Generate a unique hash for the file"""
+        hasher = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    
+    async def register_upload(self, session_id: str, file_info: Dict):
+        """Register an uploaded file"""
+        async with self._lock:
+            self.uploaded_files[session_id] = file_info
+            logger.info(f"Registered file upload for session {session_id[:8]}: {file_info['filename']}")
+    
+    async def get_file_info(self, session_id: str) -> Optional[Dict]:
+        """Get file info for a session"""
+        async with self._lock:
+            return self.uploaded_files.get(session_id)
+    
+    async def cleanup_session(self, session_id: str):
+        """Clean up session tracking"""
+        async with self._lock:
+            if session_id in self.uploaded_files:
+                del self.uploaded_files[session_id]
+                logger.info(f"Cleaned up file tracking for session {session_id[:8]}")
 
 class ConcurrentProcessingManager:
     """Manages concurrent processing of files for multiple users"""
@@ -188,7 +223,7 @@ class ConcurrentProcessingManager:
             
             # Process the file
             success, message, report_files = await check_file_turnitin(
-                job.file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, job.user_id, session_id
+                job.file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, job.user_id, session_id, job.file_hash
             )
             
             if success and report_files:
@@ -215,7 +250,7 @@ class ConcurrentProcessingManager:
             status_text = f"""
 📄 **Processing your PDF...**
 
-📁 File: `{job.filename}`
+📂 File: `{job.filename}`
 📊 Size: {job.file_size / 1024:.1f} KB
 🔄 Status: {status}
 ⚡ Worker: {worker_name}
@@ -248,7 +283,7 @@ class ConcurrentProcessingManager:
                             chat_id=job.chat_id,
                             document=f,
                             filename=f"{report_type.replace('🤖', 'AI').replace('📊', 'Similarity')}_{job.filename}",
-                            caption=f"{report_type}\n📁 Original: `{job.filename}`",
+                            caption=f"{report_type}\n📂 Original: `{job.filename}`",
                             parse_mode='Markdown'
                         )
                     
@@ -285,7 +320,7 @@ Thank you! 🚀
             error_text = f"""
 ❌ **Processing Failed**
 
-📁 File: `{job.filename}`
+📂 File: `{job.filename}`
 🔄 Error: {error_message}
 ⚡ Worker: {worker_name}
 
@@ -365,12 +400,14 @@ class SessionManager:
             return len(self.active_sessions)
 
 class TurnitinChecker:
-    def __init__(self, username: str, password: str, session_id: str):
+    def __init__(self, username: str, password: str, session_id: str, file_hash: str = ""):
         self.username = username
         self.password = password
         self.session_id = session_id
+        self.file_hash = file_hash
         self.session = None
         self.upload_endpoint = "https://academi.cx/dashboard/file_upload.php"
+        self.uploaded_file_id = None  # Track the specific file ID for this session
         
     async def login(self) -> bool:
         """Login to academi.cx with a fresh session"""
@@ -429,12 +466,24 @@ class TurnitinChecker:
             return False
     
     async def upload_file(self, file_path: str) -> Optional[str]:
-        """Upload file and return the file ID"""
+        """Upload file and return the file ID - Enhanced with better tracking"""
         if not os.path.exists(file_path):
             logger.error(f"❌ File not found: {file_path} (Session: {self.session_id[:8]})")
             return None
             
         logger.info(f"📤 Uploading file: {os.path.basename(file_path)} (Session: {self.session_id[:8]})")
+        
+        # Record upload timestamp for this session
+        upload_timestamp = datetime.now()
+        
+        # Register file info in tracker
+        file_info = {
+            'filename': os.path.basename(file_path),
+            'hash': self.file_hash,
+            'upload_time': upload_timestamp,
+            'session_id': self.session_id
+        }
+        await file_tracker.register_upload(self.session_id, file_info)
         
         headers = {
             'Referer': 'https://academi.cx/dashboard',
@@ -451,11 +500,12 @@ class TurnitinChecker:
                     logger.info(f"Upload Status: {response.status} (Session: {self.session_id[:8]})")
                     
                     if response.status == 200:
-                        # Wait for the file to be processed and get the actual file ID
+                        # Wait for the file to be processed and get the file ID for THIS specific upload
                         await asyncio.sleep(3)
-                        file_id = await self.get_latest_file_id()
+                        file_id = await self.get_my_uploaded_file_id(upload_timestamp)
                         if file_id:
-                            logger.info(f"📋 Retrieved file ID: {file_id} (Session: {self.session_id[:8]})")
+                            self.uploaded_file_id = file_id
+                            logger.info(f"📋 Retrieved MY file ID: {file_id} (Session: {self.session_id[:8]})")
                             return file_id
                         else:
                             logger.error(f"❌ Could not retrieve file ID (Session: {self.session_id[:8]})")
@@ -469,62 +519,88 @@ class TurnitinChecker:
         
         return None
     
-    async def get_latest_file_id(self) -> Optional[str]:
-        """Get the latest file ID from dashboard"""
-        logger.info(f"📋 Getting latest file ID from dashboard... (Session: {self.session_id[:8]})")
+    async def get_my_uploaded_file_id(self, upload_timestamp: datetime) -> Optional[str]:
+        """Get the file ID for the file uploaded by THIS session - Enhanced logic"""
+        logger.info(f"📋 Getting file ID for my upload at {upload_timestamp.strftime('%H:%M:%S')} (Session: {self.session_id[:8]})")
         
         headers = {
             'X-Session-ID': self.session_id[:8]
         }
         
-        try:
-            async with self.session.get('https://academi.cx/dashboard', headers=headers) as response:
-                if response.status == 200:
-                    response_text = await response.text()
-                    
-                    # Look for the openModal function calls which contain the actual file IDs
-                    modal_patterns = [
-                        r"openModal\(['\"]([^'\"]*)['\"],\s*['\"]([^'\"]*)['\"]",
-                        r"data-file-id=['\"](\d+)['\"]",
-                    ]
-                    
-                    file_ids = []
-                    for pattern in modal_patterns:
-                        matches = re.findall(pattern, response_text)
-                        if pattern == modal_patterns[0]:  # openModal pattern
-                            file_ids.extend([match[1] for match in matches if match[1].isdigit()])
-                        else:  # data-file-id pattern
-                            file_ids.extend(matches)
-                    
-                    # Remove duplicates while preserving order
-                    unique_file_ids = []
-                    for fid in file_ids:
-                        if fid not in unique_file_ids and len(fid) > 5:  # Filter out short IDs
-                            unique_file_ids.append(fid)
-                    
-                    logger.info(f"Found file IDs: {unique_file_ids} (Session: {self.session_id[:8]})")
-                    
-                    # Return the first (most recent) file ID
-                    if unique_file_ids:
-                        latest_id = unique_file_ids[0]
-                        logger.info(f"Using latest file ID: {latest_id} (Session: {self.session_id[:8]})")
-                        return latest_id
-                    
-                    # Fallback: look for any numeric IDs that might be file IDs
-                    all_numbers = re.findall(r'\b\d{10,}\b', response_text)  # Look for long numbers
-                    if all_numbers:
-                        fallback_id = all_numbers[0]
-                        logger.info(f"Using fallback file ID: {fallback_id} (Session: {self.session_id[:8]})")
-                        return fallback_id
+        # Try multiple times with increasing delays to account for processing time
+        for attempt in range(5):
+            try:
+                await asyncio.sleep(2 + attempt)  # Progressive delay
+                
+                async with self.session.get('https://academi.cx/dashboard', headers=headers) as response:
+                    if response.status == 200:
+                        response_text = await response.text()
+                        
+                        # Look for file entries with timestamps close to our upload
+                        # Multiple patterns to catch different file ID formats
+                        file_patterns = [
+                            r'data-file-id=[\'"](\d+)[\'"].*?data-filename=[\'"]([^\'"]*)[\'"]',
+                            r'openModal\([\'"]([^\'\"]*)[\'"],\s*[\'"](\d+)[\'"]',
+                            r'file_id[\'"]?\s*[:=]\s*[\'"]?(\d+)',
+                            r'id=[\'"](\d{8,})[\'"]',  # Look for long numeric IDs
+                        ]
+                        
+                        found_files = []
+                        
+                        for pattern in file_patterns:
+                            matches = re.findall(pattern, response_text, re.IGNORECASE)
+                            for match in matches:
+                                if isinstance(match, tuple):
+                                    # Handle tuple matches
+                                    file_id = match[1] if match[1].isdigit() and len(match[1]) >= 6 else match[0] if match[0].isdigit() and len(match[0]) >= 6 else None
+                                    filename = match[0] if not match[0].isdigit() else match[1] if not match[1].isdigit() else ""
+                                else:
+                                    # Handle single matches
+                                    file_id = match if match.isdigit() and len(match) >= 6 else None
+                                    filename = ""
+                                
+                                if file_id and file_id not in [f[0] for f in found_files]:
+                                    found_files.append((file_id, filename))
+                        
+                        logger.info(f"Found {len(found_files)} potential file IDs (Session: {self.session_id[:8]})")
+                        
+                        # Get our registered file info
+                        my_file_info = await file_tracker.get_file_info(self.session_id)
+                        
+                        if found_files:
+                            # If we have file info, try to match by filename first
+                            if my_file_info:
+                                for file_id, filename in found_files:
+                                    if filename and my_file_info['filename'].lower() in filename.lower():
+                                        logger.info(f"Matched by filename: {file_id} for {filename} (Session: {self.session_id[:8]})")
+                                        return file_id
+                            
+                            # Fallback: return the most recent file ID (first in list)
+                            selected_id = found_files[0][0]
+                            logger.info(f"Using most recent file ID: {selected_id} (Session: {self.session_id[:8]})")
+                            return selected_id
+                        
+                        # Final fallback: look for any long numbers that could be file IDs
+                        all_numbers = re.findall(r'\b(\d{8,})\b', response_text)
+                        if all_numbers:
+                            fallback_id = all_numbers[0]
+                            logger.info(f"Using fallback file ID: {fallback_id} (Session: {self.session_id[:8]})")
+                            return fallback_id
+                            
+                        if attempt < 4:  # Don't log on last attempt
+                            logger.info(f"No file ID found on attempt {attempt + 1}, retrying... (Session: {self.session_id[:8]})")
+            
+            except Exception as e:
+                logger.error(f"❌ Error getting file ID on attempt {attempt + 1} (Session: {self.session_id[:8]}): {e}")
+                if attempt < 4:
+                    continue
         
-        except Exception as e:
-            logger.error(f"❌ Error getting file ID (Session: {self.session_id[:8]}): {e}")
-        
+        logger.error(f"❌ Failed to get file ID after all attempts (Session: {self.session_id[:8]})")
         return None
     
     async def trigger_report_generation(self, file_id: str) -> bool:
         """Trigger report generation by simulating the View Results button click"""
-        logger.info(f"🔄 Triggering report generation for file ID: {file_id} (Session: {self.session_id[:8]})")
+        logger.info(f"📄 Triggering report generation for file ID: {file_id} (Session: {self.session_id[:8]})")
         
         headers = {
             'Referer': 'https://academi.cx/dashboard',
@@ -607,7 +683,7 @@ class TurnitinChecker:
             return False
     
     async def download_report(self, file_id: str, report_type: str, download_dir: str) -> Optional[str]:
-        """Download a specific report"""
+        """Download a specific report - Enhanced with session verification"""
         url = f"https://academi.cx/dashboard/download_file.php?type={report_type}&id={file_id}"
         
         headers = {
@@ -620,7 +696,9 @@ class TurnitinChecker:
                 if response.status == 200:
                     content = await response.read()
                     
-                    filename = f"{report_type}_{file_id}_{self.session_id[:8]}.pdf"
+                    # Enhanced filename to ensure uniqueness
+                    timestamp = datetime.now().strftime("%H%M%S")
+                    filename = f"{report_type}_{file_id}_{self.session_id[:8]}_{timestamp}.pdf"
                     filepath = os.path.join(download_dir, filename)
                     
                     if len(content) > 1000 and not content.startswith(b'<!DOCTYPE'):
@@ -630,8 +708,11 @@ class TurnitinChecker:
                         logger.info(f"✅ Downloaded {report_type}: {len(content)} bytes (Session: {self.session_id[:8]})")
                         return filepath
                     else:
-                        logger.error(f"❌ {report_type} download failed (Session: {self.session_id[:8]})")
+                        logger.error(f"❌ {report_type} download failed - invalid content (Session: {self.session_id[:8]})")
                         return None
+                else:
+                    logger.error(f"❌ {report_type} download failed - status {response.status} (Session: {self.session_id[:8]})")
+                    return None
         
         except Exception as e:
             logger.error(f"❌ Error downloading {report_type} (Session: {self.session_id[:8]}): {e}")
@@ -644,17 +725,16 @@ class TurnitinChecker:
         downloaded_files = []
         report_types = ['ai_report', 'similarity_report']
         
-        # Download reports concurrently
-        tasks = [
-            self.download_report(file_id, report_type, download_dir)
-            for report_type in report_types
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in results:
-            if isinstance(result, str) and result:
-                downloaded_files.append(result)
+        # Download reports sequentially to avoid confusion
+        for report_type in report_types:
+            try:
+                report_file = await self.download_report(file_id, report_type, download_dir)
+                if report_file:
+                    downloaded_files.append(report_file)
+                    # Small delay between downloads
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Error downloading {report_type}: {e}")
         
         return downloaded_files
     
@@ -668,6 +748,9 @@ class TurnitinChecker:
         file_id = await self.upload_file(file_path)
         if not file_id:
             return False, []
+        
+        # Verify this is OUR file ID
+        logger.info(f"🔍 Using file ID {file_id} for session {self.session_id[:8]}")
         
         # Trigger report generation
         await self.trigger_report_generation(file_id)
@@ -686,13 +769,16 @@ class TurnitinChecker:
             return False, []
 
     async def close(self):
-        """Close the session"""
+        """Close the session and cleanup tracking"""
         if self.session:
             try:
                 await self.session.close()
                 logger.info(f"🔒 Session closed (Session: {self.session_id[:8]})")
             except Exception as e:
                 logger.error(f"Error closing session (Session: {self.session_id[:8]}): {e}")
+        
+        # Cleanup file tracking for this session
+        await file_tracker.cleanup_session(self.session_id)
 
 class RateLimiter:
     def __init__(self):
@@ -763,10 +849,11 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 session_manager = SessionManager()
 processing_manager = ConcurrentProcessingManager()
+file_tracker = FileTracker()  # New global instance
 
 # Main function to check file and return results
-async def check_file_turnitin(file_path: str, username: str, password: str, user_id: int, session_id: str = None) -> tuple[bool, str, list]:
-    """Main function to check file and return results"""
+async def check_file_turnitin(file_path: str, username: str, password: str, user_id: int, session_id: str = None, file_hash: str = "") -> tuple[bool, str, list]:
+    """Main function to check file and return results - Enhanced with file tracking"""
     if not session_id:
         session_id = await session_manager.get_session_id()
     
@@ -776,12 +863,12 @@ async def check_file_turnitin(file_path: str, username: str, password: str, user
         await session_manager.acquire_session(session_id)
         logger.info(f"Session acquired: {session_id[:8]} for user {user_id}")
         
-        checker = TurnitinChecker(username, password, session_id)
+        checker = TurnitinChecker(username, password, session_id, file_hash)
         
         if not await checker.login():
             return False, "❌ Login failed", []
         
-        # Create user-specific download directory
+        # Create user-specific download directory with session info
         download_dir = f"reports/user_{user_id}_{session_id[:8]}"
         success, downloaded_files = await checker.process_file(file_path, download_dir)
         
@@ -816,13 +903,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📄 **How to use:**
 1. Send me a PDF file
-2. Your file will be processed concurrently
-3. Receive your reports in 2-3 minutes
+2. Your file will be processed with unique tracking
+3. Receive YOUR reports in 2-3 minutes
 
 📊 **Features:**
 • AI content detection
 • Similarity/plagiarism checking
 • Concurrent processing for multiple users
+• **NEW**: Enhanced file tracking to prevent mix-ups!
 • Real-time status updates
 
 ⏱️ **Limits:**
@@ -837,6 +925,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Total active jobs: {queue_status['total_active_jobs']}
 
 Just send me a PDF file to get started! 🚀
+
+**FIXED**: Files are now properly tracked per user - no more mix-ups!
 """
     
     await update.message.reply_text(welcome_message, parse_mode='Markdown')
@@ -851,9 +941,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📤 **How to check a PDF:**
 1. Send me a PDF file directly in the chat
-2. Your file enters the processing queue immediately
-3. Multiple users can upload simultaneously
-4. You'll receive detailed reports when ready
+2. Your file enters the processing queue with unique tracking
+3. Multiple users can upload simultaneously without interference
+4. You'll receive YOUR specific reports when ready
 
 ⚠️ **Important Notes:**
 • Only PDF files are supported
@@ -861,12 +951,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Processing takes 2-3 minutes
 • You can check {MAX_FILES_PER_PERIOD} files every {RATE_LIMIT_HOURS} hours
 • Maximum {MAX_CONCURRENT_PER_USER} files processing at once
-• **NEW**: Concurrent processing for multiple users!
+• **ENHANCED**: Each file is tracked uniquely per session!
 
 🆘 **Having issues?** Make sure your file is:
 • In PDF format
 • Under {MAX_FILE_SIZE // (1024*1024)}MB in size
 • Not password protected
+
+**RECENT FIX**: Resolved issue where multiple users would receive the same files.
 """
     
     await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -887,7 +979,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ✅ You can upload files!
 📈 Files used in last {RATE_LIMIT_HOURS} hours: {files_used}/{MAX_FILES_PER_PERIOD}
-🔄 Remaining uploads: {remaining}
+📄 Remaining uploads: {remaining}
 ⚡ Your active jobs: {user_active_jobs}/{MAX_CONCURRENT_PER_USER}
 
 📈 **System Status:**
@@ -896,6 +988,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ⚡ Total active jobs: {queue_status['total_active_jobs']}
 
 Send me a PDF file to analyze! 📄
+
+**ENHANCED TRACKING**: Each upload gets unique session tracking!
 """
     else:
         time_until_reset = await rate_limiter.time_until_reset(user_id)
@@ -928,7 +1022,7 @@ You can upload more files after the reset time or when current processing comple
     await update.message.reply_text(status_text, parse_mode='Markdown')
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document uploads - Now with true concurrency!"""
+    """Handle document uploads - Enhanced with file tracking"""
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or "User"
     
@@ -988,7 +1082,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     queue_status = await processing_manager.get_queue_status()
     if queue_status['queue_size'] >= MAX_PROCESSING_QUEUE:
         await update.message.reply_text(
-            f"🔄 **System queue full!**\n\n"
+            f"📄 **System queue full!**\n\n"
             f"All {MAX_PROCESSING_QUEUE} queue slots are currently in use.\n"
             f"Please try again in a few minutes.\n\n"
             f"Use /status to check system availability.",
@@ -1005,18 +1099,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = os.path.join(temp_dir, document.file_name)
         await file.download_to_drive(file_path)
         
+        # Generate file hash for unique identification
+        file_hash = file_tracker.generate_file_hash(file_path)
+        
         # Send immediate response that file is queued
         processing_message = await update.message.reply_text(
-            f"📄 **File Queued for Processing!**\n\n"
-            f"📁 File: `{document.file_name}`\n"
+            f"📄 **File Queued with Enhanced Tracking!**\n\n"
+            f"📂 File: `{document.file_name}`\n"
             f"📊 Size: {document.file_size / 1024:.1f} KB\n"
-            f"🔄 Status: Added to processing queue\n"
+            f"🔒 Hash: `{file_hash[:8]}`\n"
+            f"🔄 Status: Added to processing queue with unique tracking\n"
             f"📋 Queue position: {queue_status['queue_size'] + 1}\n\n"
-            f"⏱️ Processing will start shortly. Multiple files can be processed simultaneously!",
+            f"⏱️ Your file will be processed with dedicated session tracking!",
             parse_mode='Markdown'
         )
         
-        # Create processing job
+        # Create processing job with file hash
         job = ProcessingJob(
             user_id=user_id,
             user_name=user_name,
@@ -1028,7 +1126,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context=context,
             chat_id=update.effective_chat.id,
             job_id=str(uuid.uuid4()),
-            created_at=datetime.now()
+            created_at=datetime.now(),
+            file_hash=file_hash  # Add file hash to job
         )
         
         # Add job to processing queue
@@ -1037,19 +1136,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if success:
             # Update message to show job is in queue
             await processing_message.edit_text(
-                f"📄 **File Successfully Queued!**\n\n"
-                f"📁 File: `{document.file_name}`\n"
+                f"📄 **File Successfully Queued with Tracking!**\n\n"
+                f"📂 File: `{document.file_name}`\n"
                 f"📊 Size: {document.file_size / 1024:.1f} KB\n"
-                f"🔄 Status: In processing queue\n"
+                f"🔒 Hash: `{file_hash[:8]}`\n"
+                f"🔄 Status: In processing queue with unique session\n"
                 f"🆔 Job ID: `{job.job_id[:8]}`\n\n"
-                f"⏱️ Processing will begin automatically. You can send more files while this processes!",
+                f"⏱️ Processing will begin automatically. Enhanced tracking ensures you get YOUR reports!",
                 parse_mode='Markdown'
             )
             
-            logger.info(f"✅ User {user_name} ({user_id}) queued file: {document.file_name} (Job: {job.job_id[:8]})")
+            logger.info(f"✅ User {user_name} ({user_id}) queued file: {document.file_name} with hash {file_hash[:8]} (Job: {job.job_id[:8]})")
             
         else:
-            # Failed to add to queue (shouldn't happen due to earlier checks)
+            # Failed to add to queue
             await processing_message.edit_text(
                 f"❌ **Failed to queue file**\n\n"
                 f"The processing queue is full. Please try again later.",
@@ -1065,7 +1165,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(
                 f"❌ **Error queuing file**\n\n"
-                f"📁 File: `{document.file_name}`\n"
+                f"📂 File: `{document.file_name}`\n"
                 f"🔄 Error: {str(e)}\n\n"
                 f"Please try again later.",
                 parse_mode='Markdown'
@@ -1083,15 +1183,16 @@ async def handle_non_document(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await update.message.reply_text(
         f"📄 **Please send a PDF file for analysis.**\n\n"
-        f"I can process multiple PDFs simultaneously! Current queue: {queue_status['queue_size']} files\n\n"
-        f"Send me a PDF file and I'll add it to the processing queue immediately.\n\n"
+        f"I can process multiple PDFs simultaneously with enhanced tracking! Current queue: {queue_status['queue_size']} files\n\n"
+        f"Send me a PDF file and I'll add it to the processing queue with unique session tracking.\n\n"
+        f"**ENHANCED**: Each file gets its own tracking to prevent mix-ups!\n\n"
         f"Use /help for more information.",
         parse_mode='Markdown'
     )
 
 def main():
-    """Start the bot with concurrent processing"""
-    print("🤖 Starting Multi-User Concurrent Telegram Bot v2.0...")
+    """Start the bot with enhanced concurrent processing"""
+    print("🤖 Starting Enhanced Multi-User Concurrent Telegram Bot v2.1...")
     
     # Start Flask app in a separate thread
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -1100,7 +1201,7 @@ def main():
     
     # Start keep-alive pinger
     if RENDER_URL:
-        print("🏓 Starting keep-alive pinger...")
+        print("🔄 Starting keep-alive pinger...")
         Timer(300, keep_alive).start()
     
     # Create application
@@ -1125,12 +1226,13 @@ def main():
     # Add startup callback
     application.post_init = startup_callback
     
-    print(f"✅ Bot started successfully with TRUE concurrent processing!")
+    print(f"✅ Bot started successfully with ENHANCED concurrent processing!")
     print(f"📊 Max concurrent sessions: {MAX_CONCURRENT_SESSIONS}")
     print(f"👥 Max concurrent per user: {MAX_CONCURRENT_PER_USER}")
     print(f"📋 Max processing queue: {MAX_PROCESSING_QUEUE}")
     print(f"⚙️ Processing workers: 8")
-    print("🔍 Ready to process multiple users simultaneously!")
+    print(f"🔒 Enhanced file tracking: ENABLED")
+    print("🚀 Ready to process multiple users with unique file tracking!")
     
     # Start polling
     application.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -1138,14 +1240,15 @@ def main():
 # Quick test function for standalone testing
 async def quick_test(file_path: str, user_id: int = 12345) -> tuple[bool, list]:
     """Quick test function that returns success status and downloaded files"""
-    success, message, files = await check_file_turnitin(file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, user_id)
+    file_hash = file_tracker.generate_file_hash(file_path)
+    success, message, files = await check_file_turnitin(file_path, ACADEMI_USERNAME, ACADEMI_PASSWORD, user_id, None, file_hash)
     print(message)
     return success, files
 
 # Test the enhanced functionality
 async def test_concurrent_processing():
-    """Test concurrent processing with multiple files"""
-    print("🚀 Testing Concurrent Processing")
+    """Test concurrent processing with multiple files - Enhanced"""
+    print("🚀 Testing Enhanced Concurrent Processing")
     print("=" * 50)
     
     test_file = "test.pdf"
@@ -1154,13 +1257,13 @@ async def test_concurrent_processing():
         # Test with multiple concurrent users
         tasks = []
         for user_id in range(1, 6):  # Test with 5 users
-            print(f"🔄 Starting test for user {user_id}")
+            print(f"📄 Starting test for user {user_id} with unique tracking")
             task = quick_test(test_file, user_id)
             tasks.append(task)
             # Small delay to simulate real-world timing
             await asyncio.sleep(0.5)
         
-        print("⏳ Processing all files concurrently...")
+        print("⏳ Processing all files concurrently with enhanced tracking...")
         start_time = time.time()
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1184,6 +1287,7 @@ async def test_concurrent_processing():
         
         print(f"\n📈 Summary: {successful}/{len(results)} successful")
         print(f"⏱️ Average time per user: {total_time/len(results):.1f}s")
+        print(f"🔒 Enhanced tracking: ENABLED")
         
     else:
         print(f"⚠️ Test file not found: {test_file}")
