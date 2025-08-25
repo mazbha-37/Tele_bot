@@ -424,7 +424,7 @@ class IsolatedTurnitinChecker:
             # Upload with verification
             file_id = await self.upload_file_with_verification(file_path)
             if not file_id:
-                return False, [], []
+                return False, "Upload failed - could not get file ID", []
             
             logger.info(f"📋 Using verified file ID: {file_id}")
             
@@ -554,7 +554,7 @@ class ConcurrentProcessingManager:
             
             # Process with isolation
             download_dir = f"reports/isolated_{job.user_id}_{job.session_id[:8]}_{job.job_id[:8]}"
-            success, report_files = await checker.process_file_isolated(job.file_path, download_dir)
+            success, message, report_files = await checker.process_file_isolated(job.file_path, download_dir)
             
             if success and report_files:
                 await self._send_isolated_reports(job, report_files, worker_name)
