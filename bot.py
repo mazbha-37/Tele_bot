@@ -336,8 +336,7 @@ class IsolatedTurnitinChecker:
                         # Look for files uploaded around our timestamp
                         file_patterns = [
                             r'data-file-id=[\'"](\d+)[\'"].*?data-filename=[\'"]([^\'"]*)[\'"]',
-                            r'file_id[\'"]?\s*[:=]\s*[\'"]?(\d+)',
-                            r'openModal\([\'"]([^\'\"]*)[\'"],\s*[\'"](\d+)[\'"]'
+                            r'file_id[\'"]?\s*[:=]\s*[\'"]?(\d+)'
                         ]
                         
                         found_files = []
@@ -351,14 +350,11 @@ class IsolatedTurnitinChecker:
                                 else:
                                     file_id = match if match.isdigit() and len(match) >= 6 else None
                                     filename = ""
-                                
+                                 
                                 if file_id:
                                     found_files.append((file_id, filename))
                         
-                        # Remove duplicates
-                        found_files = list(set(found_files))
-                        
-                        logger.info(f"Found {len(found_files)} potential files for session {self.session_id[:8]}")
+                        found_files = list(set(found_files))  # Remove duplicates
                         
                         if found_files:
                             # Try to match by filename first
@@ -367,7 +363,7 @@ class IsolatedTurnitinChecker:
                                     logger.info(f"✅ Matched by filename: {file_id} -> {filename}")
                                     return file_id
                             
-                            # If no filename match, use the most recent (first) file
+                            # If no filename match, use the most recent file
                             selected_id = found_files[0][0]
                             logger.info(f"📋 Using most recent file ID: {selected_id}")
                             return selected_id
@@ -418,7 +414,7 @@ class IsolatedTurnitinChecker:
             logger.error(f"❌ Error downloading {report_type}: {e}")
             return None
     
-    async def process_file_isolated(self, file_path: str, download_dir: str) -> tuple[bool, list]:
+    async def process_file_isolated(self, file_path: str, download_dir: str) -> tuple[bool, str, list]:
         """Process file with complete isolation"""
         logger.info(f"🚀 Processing file in isolation: session {self.session_id[:8]}, job {self.job_id[:8]}")
         
@@ -428,7 +424,7 @@ class IsolatedTurnitinChecker:
             # Upload with verification
             file_id = await self.upload_file_with_verification(file_path)
             if not file_id:
-                return False, []
+                return False, [], []
             
             logger.info(f"📋 Using verified file ID: {file_id}")
             
@@ -448,14 +444,14 @@ class IsolatedTurnitinChecker:
             
             if downloaded_files:
                 logger.info(f"✅ Successfully processed with {len(downloaded_files)} reports")
-                return True, downloaded_files
+                return True, "Processing complete!", downloaded_files
             else:
                 logger.error(f"❌ No reports downloaded for session {self.session_id[:8]}")
-                return False, []
+                return False, "No reports generated", []
                 
         except Exception as e:
             logger.error(f"❌ Processing error for session {self.session_id[:8]}: {e}")
-            return False, []
+            return False, f"Processing error: {str(e)}", []
     
     async def close(self):
         """Close session and cleanup"""
@@ -796,8 +792,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = f"""
 🤖 **Welcome to Enhanced PDF Checker Bot!**
 
-🔒 **NEW: Complete Session Isolation!**
-Each file gets its own isolated session to prevent mix-ups.
 
 📄 **How to use:**
 1. Send me a PDF file
@@ -822,7 +816,7 @@ Each file gets its own isolated session to prevent mix-ups.
 • Queue size: {queue_status['queue_size']}
 • Total active: {queue_status['total_active_jobs']}
 
-**🔒 ISOLATION GUARANTEE: Each upload gets completely isolated processing!**
+
 
 Send me a PDF to start! 🚀
 """
@@ -850,7 +844,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚠️ **Requirements:**
 • PDF format only
-• Max {MAX_FILE_SIZE // (1024*1024)}MB size
+• Max {MAX_FILE_SIZE // (1024 * 1024)}MB size
 • Processing: 2-3 minutes
 • Rate limit: {MAX_FILES_PER_PERIOD} files per {RATE_LIMIT_HOURS}h
 
